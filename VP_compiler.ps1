@@ -122,7 +122,8 @@ public class FileViewModel : INotifyPropertyChanged {
             OnPropertyChanged();
         }
     }
-    public byte[] Data { get; set; }
+    public int SeekType { get; set; }
+    public string ExternalVP { get; set; }
 
     public void OnPropertyChanged([CallerMemberName]string caller = null) {
         var handler = PropertyChanged;
@@ -135,6 +136,12 @@ public class FileViewModel : INotifyPropertyChanged {
 #endregion
 
 #region classes
+enum SeekTypes {
+    Present = 0
+    FileSystem = 1
+    External = 2
+}
+
 class WAVPlayer {
     $Runspace = $null
     $Session = $null
@@ -153,11 +160,20 @@ class WAVPlayer {
                 $script:item = $Sync.Gui.gridFiles.SelectedItem
             })
 
-            [System.IO.Stream]$stream = New-Object System.IO.MemoryStream($item.Data, 0, $item.Data.Count)
-            $Sync.Player = New-Object System.Media.SoundPlayer($stream)
-            $Sync.Player.Play()
-            $stream.Close()
+            if ($item.SeekType -eq 0) {
+                $buffer = [byte[]]::CreateInstance([byte], $item.Size)
+                $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($VP_Filename, "Open")))
+                [void]$reader.BaseStream.Seek($item.Offset, "Begin")
+                [void]$reader.Read($buffer, 0, $item.Size)
+                $reader.Close()
+
+                [System.IO.Stream]$stream = New-Object System.IO.MemoryStream($buffer, 0, $buffer.Count)
+                $Sync.Player = New-Object System.Media.SoundPlayer($stream)
+                $Sync.Player.Play()
+                $stream.Close()
+            }
         }, $true)
+        $this.Runspace.SessionStateProxy.SetVariable("VP_Filename", $global:VP_Filename)
 
         # invoke the runspace session created above
         $this.Session.Runspace = $this.Runspace
@@ -182,7 +198,7 @@ $Sync = [HashTable]::Synchronized(@{})
 # init runspace
 $Runspace = [RunspaceFactory]::CreateRunspace()
 $Runspace.ApartmentState = [Threading.ApartmentState]::STA
-$Runspace.ThreadOptions = "ReuseThread"         
+$Runspace.ThreadOptions = "ReuseThread"
 $Runspace.Open()
 
 # provide the other thread with the synchronized hashtable (variable shared across threads)
@@ -351,8 +367,10 @@ $global:Flag_Changed = $false
 [ScriptBlock]$SaveCommand = {
     param([string]$filename)
 
+    [string]$tmp_filename = Join-Path ([IO.Path]::GetDirectoryName($filename)) "$((New-Guid).Guid).tmp"
+
     [UInt32]$position = 16
-    [UInt32]$diroffset = $position + ($Sync.ViewFiles | ForEach-Object { $_.Data.Count } | Measure-Object -Sum).Sum
+    [UInt32]$diroffset = $position + ($Sync.ViewFiles | ForEach-Object { $_.Size } | Measure-Object -Sum).Sum
     [UInt32]$index_position = $diroffset
     [UInt32]$totalbytes = $diroffset
     [UInt32]$direntries = $Sync.ViewFiles.Count
@@ -375,71 +393,157 @@ $global:Flag_Changed = $false
 
     # compute total VP bytes to write
     $totalbytes += $direntries * 44
+    $writer = $null
+    $stream = $null
+    $CurrentReader = $null
 
 
     # instantiate VP file bytes
-    [byte[]]$VP_Bytes = [byte[]]::CreateInstance([byte], $totalbytes)
-    # init all bytes = 0
-    [Array]::Clear($VP_Bytes, 0, $totalbytes)
+    [byte[]]@([byte]0) | Set-Content -LiteralPath $tmp_filename -AsByteStream
 
-    # write header
-    [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes("VPVP"), 0, $VP_Bytes, 0, 4)
-    [Array]::Copy([System.BitConverter]::GetBytes(2), 0, $VP_Bytes, 4, 4)
-    [Array]::Copy([System.BitConverter]::GetBytes($diroffset), 0, $VP_Bytes, 8, 4)
-    [Array]::Copy([System.BitConverter]::GetBytes($direntries), 0, $VP_Bytes, 12, 4)
+    try {
+        $stream = New-Object IO.FileStream($tmp_filename, "Open", "ReadWrite")
+        $writer = New-Object IO.StreamWriter($stream)
+        $CurrentReader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($global:VP_Filename, "Open")))
 
-    $stack.Push($Sync.Gui.treeVPP.Items[0])
-    # a list of directories flagged as visited
-    $visited = New-Object System.Collections.ArrayList
+        [void]$writer.BaseStream.SetLength($totalbytes)
+        [void]$writer.BaseStream.Seek(0, "Begin")
 
-    # write files and file index
-    while ($stack.Count -gt 0) {
-        $dir = $stack.Peek()
+        # write header
+        [void]$writer.BaseStream.Write([System.Text.Encoding]::ASCII.GetBytes("VPVP"), 0, 4)
+        [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes(2), 0, 4)
+        [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($diroffset), 0, 4)
+        [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($direntries), 0, 4)
 
-        if ($dir -notin $visited) {
-            # flag directory as visited
-            $visited.Add($dir)
+        $stack.Push($Sync.Gui.treeVPP.Items[0])
+        # a list of directories flagged as visited
+        $visited = New-Object System.Collections.ArrayList
 
-            # write directory index info
-            [Array]::Copy([System.BitConverter]::GetBytes($position), 0, $VP_Bytes, $index_position, 4)
-            [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes($dir.Header), 0, $VP_Bytes, $index_position + 8, $dir.Header.Length)
-            $index_position += 44
-        }
+        # write files and file index
+        while ($stack.Count -gt 0) {
+            $dir = $stack.Peek()
 
-        for ([int]$n = $dir.Items.Count - 1; $n -ge 0; $n--) {
-            if ($dir.Items[$n] -notin $visited) {
-                $stack.Push($dir.Items[$n])
+            if ($dir -notin $visited) {
+                [void]$writer.BaseStream.Seek($index_position, "Begin")
+
+                # flag directory as visited
+                $visited.Add($dir)
+
+                # write directory index info
+                [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($position), 0, 4)
+                [void]$writer.BaseStream.Seek($index_position + 8, "Begin")
+                [void]$writer.BaseStream.Write([System.Text.Encoding]::ASCII.GetBytes($dir.Header), 0, $dir.Header.Length)
+                $index_position += 44
             }
-        }
 
-        if ($stack.Peek() -eq $dir) {
-            # retrieve all files under current directory tag
-            $files = $Sync.ViewFiles | Where-Object { $_.Path -eq $dir.Tag.ToString() } | Sort-Object -Property Filename
+            for ([int]$n = $dir.Items.Count - 1; $n -ge 0; $n--) {
+                if ($dir.Items[$n] -notin $visited) {
+                    $stack.Push($dir.Items[$n])
+                }
+            }
 
-            foreach ($file in $files) {
-                # write file index info
-                [Array]::Copy([System.BitConverter]::GetBytes($position), 0, $VP_Bytes, $index_position, 4)
-                [Array]::Copy([System.BitConverter]::GetBytes($file.Size), 0, $VP_Bytes, $index_position + 4, 4)
-                [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes($file.Filename), 0, $VP_Bytes, $index_position + 8, $file.Filename.Length)
-                [Array]::Copy([System.BitConverter]::GetBytes($file.Timestamp), 0, $VP_Bytes, $index_position + 40, 4)
+            if ($stack.Peek() -eq $dir) {
+                # retrieve all files under current directory tag
+                $files = $Sync.ViewFiles | Where-Object { $_.Path -eq $dir.Tag.ToString() } | Sort-Object -Property Filename
+                [byte[]]$buffer = $null
+
+                foreach ($file in $files) {
+                    [void]$writer.BaseStream.Seek($index_position, "Begin")
+
+                    switch ($file.SeekType) {
+                        ([int][SeekTypes]::Present) {
+                            # handle files already present
+                            $buffer = [byte[]]::CreateInstance([byte], $file.Size)
+                            [void]$CurrentReader.BaseStream.Seek($file.Offset, "Begin")
+                            [void]$CurrentReader.Read($buffer, 0, $file.Size)
+                        }
+
+                        ([int][SeekTypes]::FileSystem) {
+                            # handle files added from filesystem
+                            if (Test-Path -LiteralPath $file.Filename) {
+                                $buffer = [System.IO.File]::ReadAllBytes($file.Filename)
+                                $file.Filename = [IO.Path]::GetFileName($file.Filename)
+                            }
+                        }
+
+                        ([int][SeekTypes]::External) {
+                            # handle files from an external VP
+                            if (Test-Path -LiteralPath $file.ExternalVP) {
+                                $reader = $null
+
+                                try {
+                                    $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($file.ExternalVP, "Open")))
+                                    [void]$reader.BaseStream.Seek($file.Offset, "Begin")
+                                    $buffer = [byte[]]::CreateInstance([byte], $file.Size)
+                                    [void]$reader.Read($buffer, 0, $file.Size)
+                                } catch {
+                                    $buffer = [byte[]]::CreateInstance([byte], $file.Size)
+                                    [Array]::Clear($buffer, 0, $file.Size)
+                                }
+
+                                if ($null -ne $reader) {
+                                    $reader.Close()
+                                }
+                            } elseif ($file.ExternalVP.Trim().Length -eq 0) {
+                                [System.Windows.MessageBox]::Show("You did not set the 'ExternalVP' field for '$($file.Filename)'")
+                            }
+                        }
+                    }
+
+                    # write file index info
+                    [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($position), 0, 4)
+                    [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($file.Size), 0, 4)
+                    [void]$writer.BaseStream.Write([System.Text.Encoding]::ASCII.GetBytes($file.Filename), 0, $file.Filename.Length)
+
+                    [void]$writer.BaseStream.Seek($index_position + 40, "Begin")
+                    [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($file.Timestamp), 0, 4)
+                    $index_position += 44
+
+                    # write file bytes
+                    [void]$writer.BaseStream.Seek($position, "Begin")
+                    [void]$writer.BaseStream.Write($buffer, 0, $buffer.Count)
+
+                    $position += $file.Size
+                }
+
+                # write backdir index info
+                [void]$writer.BaseStream.Seek($index_position, "Begin")
+                [void]$writer.BaseStream.Write([System.BitConverter]::GetBytes($position), 0, 4)
+                [void]$writer.BaseStream.Seek($index_position + 8, "Begin")
+                [void]$writer.BaseStream.Write([System.Text.Encoding]::ASCII.GetBytes(".."), 0, 2)
                 $index_position += 44
 
-                # write file bytes
-                [Array]::Copy($file.Data, 0, $VP_Bytes, $position, $file.Data.Count)
-                $position += $file.Data.Count
+                [void]$stack.Pop()
             }
-
-            # write backdir index info
-            [Array]::Copy([System.BitConverter]::GetBytes($position), 0, $VP_Bytes, $index_position, 4)
-            [Array]::Copy([System.Text.Encoding]::ASCII.GetBytes(".."), 0, $VP_Bytes, $index_position + 8, 2)
-            $index_position += 44
-
-            [void]$stack.Pop()
         }
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        Write-Host "expression: $($_.InvocationInfo.Line.Trim())" -ForegroundColor Red
+        Write-Host "on line $($_.InvocationInfo.ScriptLineNumber), character $($_.InvocationInfo.OffsetInLine)" -ForegroundColor Red
     }
 
-    # write bytes to file
-    [System.IO.File]::WriteAllBytes($filename, $VP_Bytes)
+    if ($null -ne $writer) {
+        $writer.Close()
+    }
+    if ($null -ne $stream) {
+        $stream.Close()
+    }
+    if ($null -ne $CurrentReader) {
+        $CurrentReader.Close()
+    }
+
+    try {
+        if (Test-Path -LiteralPath $filename) {
+            Remove-Item -LiteralPath $filename -Force
+        }
+
+        Rename-Item -LiteralPath $tmp_filename -NewName $filename
+        $player.Stop()
+        $global:VP_Filename = $filename
+        $ReadVPP.Invoke($filename)
+    } catch {
+        Write-Host $_ -ForegroundColor Red
+    }
 }
 
 [ScriptBlock]$SaveAsCommand = {
@@ -509,13 +613,27 @@ $global:Flag_Changed = $false
         [FileViewModel]$item
     )
 
-    [System.IO.File]::WriteAllBytes($FilePath, $item.Data)
+    [byte[]]$buffer = $null
 
-    # write created/modified date
-    $dtDateTime = $ConvertTimestamp.Invoke($item.Timestamp)[0]
-    $FileData = Get-Item -LiteralPath $FilePath
-    $FileData.LastWriteTime = $dtDateTime
-    $FileData.CreationTime = $dtDateTime
+    switch ($item.SeekType) {
+        ([int][SeekTypes]::Present) {
+            $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($global:VP_Filename, "Open")))
+            [void]$reader.BaseStream.Seek($item.Offset, "Begin")
+            $buffer = [byte[]]::CreateInstance([byte], $item.Size)
+            [void]$reader.Read($buffer, 0, $item.Size)
+            $reader.Close()
+        }
+    }
+
+    if (($item.SeekType -eq ([int][SeekTypes]::Present)) -and ($null -ne $buffer)) {
+        [System.IO.File]::WriteAllBytes($FilePath, $buffer)
+
+        # write created/modified date
+        $dtDateTime = $ConvertTimestamp.Invoke($item.Timestamp)[0]
+        $FileData = Get-Item -LiteralPath $FilePath
+        $FileData.LastWriteTime = $dtDateTime
+        $FileData.CreationTime = $dtDateTime
+    }
 }
 
 [ScriptBlock]$OpenFile = {
@@ -525,6 +643,103 @@ $global:Flag_Changed = $false
         $WriteDataAndTimestamp.Invoke($FilePath, $item)
         Invoke-Item -LiteralPath $FilePath
     }
+}
+
+[ScriptBlock]$ReadVPP = {
+    param([string]$FilePath)
+
+    [System.IO.BinaryReader]$reader = $null
+    [byte[]]$buffer = [byte[]]::CreateInstance([byte], 16)
+
+    $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($FilePath, "Open")))
+
+    [System.Windows.Controls.TreeViewItem]$node = $null
+    $path = New-Object System.Collections.ArrayList
+
+    # header
+    [void]$reader.Read($buffer, 0, 16)
+    [string]$header = [System.Text.Encoding]::ASCII.GetString($buffer, 0, 4) #VPVP
+    [UInt32]$version = [System.BitConverter]::ToUInt32($buffer, 4) #2
+    [UInt32]$diroffset = [System.BitConverter]::ToUInt32($buffer, 8)
+    [UInt32]$direntries = [System.BitConverter]::ToUInt32($buffer, 12)
+
+    if (($header -eq "VPVP") -and ($version -eq 2)) {
+        $Sync.Gui.treeVPP.Items.Clear()
+        $Sync.ViewFiles.Clear()
+        $global:VP_Filename = $FilePath
+
+        for ([int]$n = 0; $n -lt $direntries; $n++) {
+            [void]$reader.BaseStream.Seek($diroffset, "Begin")
+
+            $tbl = @{
+                Offset = $reader.ReadUInt32() # 4 bytes
+                Size = $reader.ReadUInt32() # 4 bytes
+                Filename = [System.Text.Encoding]::ASCII.GetString($reader.ReadBytes(32)).Split([byte]0)[0] # 32 bytes
+                Timestamp = $reader.ReadUInt32() # 4 bytes
+            }
+
+            # entry is a directory
+            if (($tbl.Size -eq 0) -and ($tbl.Timestamp -eq 0)) {
+                $tbl.Filename = $tbl.Filename.TrimEnd("?")
+
+                if ($Sync.Gui.treeVPP.Items.Count -eq 0) {
+                    # should always be the "data" root dir
+                    $node = New-Object System.Windows.Controls.TreeViewItem -Property @{
+                        Header = $tbl.Filename
+                        Tag = $tbl.Filename
+                    }
+
+                    $Sync.Gui.treeVPP.Items.Add($node)
+
+                    $path.Add($node.Header)
+                } else {
+                    # entry is a backdir
+                    if ($tbl.Filename -eq "..") {
+                        $path.RemoveAt($path.Count - 1)
+
+                        if ($node.Parent -isnot [System.Windows.Controls.TreeView]) {
+                            <#
+                            $Sync.Gui.treeVPP.Items.Add((New-Object System.Windows.Controls.TreeViewItem -Property @{
+                                Header = "All files"
+                                Tag = [string]::Empty
+                            }))
+                        } else {
+                            #>
+                            $node = $node.Parent
+                        }
+                    } else {
+                        $newNode = New-Object System.Windows.Controls.TreeViewItem -Property @{
+                            Header = $tbl.Filename
+                        }
+
+                        $node.Items.Add($newNode)
+                        $node.IsExpanded = $true
+
+                        $path.Add($newNode.Header)
+                        $newNode.Tag = [string]::Join("\", @($path))
+
+                        $node = $newNode
+                    }
+                }
+            } else {
+                [void]$Sync.ViewFiles.Add((New-Object FileViewModel -Property @{
+                    Offset = $tbl.Offset
+                    Size = $tbl.Size
+                    Filename = $tbl.Filename
+                    Timestamp = $tbl.Timestamp
+                    Path = [string]::Join("\", @($path))
+                    SeekType = [SeekTypes]::Present
+                }))
+            }
+
+            # 4 + 4 + 32 + 4 = 44
+            $diroffset += 44
+        }
+    } else {
+        throw "'$FilePath' is not a valid VP"
+    }
+
+    $reader.Close()
 }
 
 function Invoke-InputBox {
@@ -647,7 +862,7 @@ $Sync.Gui.mnuOpen.add_Click({
     if (($InstallLocation.Length -gt 0) -and (Test-Path -LiteralPath $InstallLocation)) {
         $ofd.InitialDirectory = $InstallLocation
     }
-    
+
     if ($global:VP_Filename.Length -gt 0) {
         $ofd.FileName = $global:VP_Filename
     }
@@ -655,95 +870,10 @@ $Sync.Gui.mnuOpen.add_Click({
     if ($ofd.ShowDialog()) {
         $player.Stop()
 
-        [byte[]]$filebytes = [System.IO.File]::ReadAllBytes($ofd.FileName)
-        [System.Windows.Controls.TreeViewItem]$node = $null
-        $path = New-Object System.Collections.ArrayList
-    
-        # header
-        [string]$header = [System.Text.Encoding]::ASCII.GetString($filebytes, 0, 4) #VPVP
-        [UInt32]$version = [System.BitConverter]::ToUInt32($filebytes, 4) #2
-        [UInt32]$diroffset = [System.BitConverter]::ToUInt32($filebytes, 8)
-        [UInt32]$direntries = [System.BitConverter]::ToUInt32($filebytes, 12)
-    
-        if (($header -eq "VPVP") -and ($version -eq 2)) {
-            $Sync.Gui.treeVPP.Items.Clear()
-            $Sync.ViewFiles.Clear()
-            $global:VP_Filename = $ofd.FileName
-
-            for ([int]$n = 0; $n -lt $direntries; $n++) {
-                $tbl = @{
-                    Offset = [System.BitConverter]::ToUInt32($filebytes, $diroffset) # 4 bytes
-                    Size = [System.BitConverter]::ToUInt32($filebytes, $diroffset + 4) # 4 bytes
-                    Filename = [System.Text.Encoding]::ASCII.GetString($filebytes, $diroffset + 8, 32) # 32 bytes
-                    Timestamp = [System.BitConverter]::ToUInt32($filebytes, $diroffset + 40) # 4 bytes
-                }
-
-                [int]$idx = $tbl.Filename.IndexOf(0)
-                if ($idx -gt 0) {
-                    $tbl.Filename = $tbl.Filename.Substring(0, $idx)
-                }
-
-                # entry is a directory
-                if (($tbl.Size -eq 0) -and ($tbl.Timestamp -eq 0)) {
-                    $tbl.Filename = $tbl.Filename.TrimEnd("?")
-
-                    if ($Sync.Gui.treeVPP.Items.Count -eq 0) {
-                        # should always be the "data" root dir
-                        $node = New-Object System.Windows.Controls.TreeViewItem -Property @{
-                            Header = $tbl.Filename
-                            Tag = $tbl.Filename
-                        }
-
-                        $Sync.Gui.treeVPP.Items.Add($node)
-
-                        $path.Add($node.Header)
-                    } else {
-                        # entry is a backdir
-                        if ($tbl.Filename -eq "..") {
-                            $path.RemoveAt($path.Count - 1)
-
-                            if ($node.Parent -isnot [System.Windows.Controls.TreeView]) {
-                                <#
-                                $Sync.Gui.treeVPP.Items.Add((New-Object System.Windows.Controls.TreeViewItem -Property @{
-                                    Header = "All files"
-                                    Tag = [string]::Empty
-                                }))
-                            } else {
-                                #>
-                                $node = $node.Parent
-                            }
-                        } else {
-                            $newNode = New-Object System.Windows.Controls.TreeViewItem -Property @{
-                                Header = $tbl.Filename
-                            }
-
-                            $node.Items.Add($newNode)
-                            $node.IsExpanded = $true
-
-                            $path.Add($newNode.Header)
-                            $newNode.Tag = [string]::Join("\", @($path))
-
-                            $node = $newNode
-                        }
-                    }
-                } else {
-                    [void]$Sync.ViewFiles.Add((New-Object FileViewModel -Property @{
-                        Offset = $tbl.Offset
-                        Size = $tbl.Size
-                        Filename = $tbl.Filename
-                        Timestamp = $tbl.Timestamp
-                        Path = [string]::Join("\", @($path))
-                    }))
-
-                    $Sync.ViewFiles[-1].Data = [byte[]]::CreateInstance([byte], $Sync.ViewFiles[-1].Size)
-                    [Array]::Copy($filebytes, $Sync.ViewFiles[-1].Offset, $Sync.ViewFiles[-1].Data, 0, $Sync.ViewFiles[-1].Size)
-                }
-    
-                # 4 + 4 + 32 + 4 = 44
-                $diroffset += 44
-            }
-        } else {
-            [void][Windows.MessageBox]::Show("'$($ofd.FileName)' is not a valid VP")
+        try {
+            $ReadVPP.Invoke($ofd.FileName)
+        } catch {
+            [void][Windows.MessageBox]::Show($_.Exception.Message)
         }
     }
 })
@@ -766,6 +896,8 @@ $Sync.Gui.mnuExtractAll.add_Click({
 
         if ($fbd.ShowDialog() -eq "OK") {
             $BasePath = $fbd.SelectedPath
+            $reader = New-Object System.IO.BinaryReader((New-Object System.IO.FileStream($global:VP_Filename, "Open")))
+            [byte[]]$buffer = $null
 
             foreach ($file in $Sync.ViewFiles) {
                 [string]$FileDir = Join-Path $BasePath $file.Path
@@ -775,8 +907,28 @@ $Sync.Gui.mnuExtractAll.add_Click({
                     mkdir $FileDir
                 }
 
-                $WriteDataAndTimestamp.Invoke($FilePath, $file)
+                $buffer = $null
+
+                switch ($file.SeekType) {
+                    0 {
+                        [void]$reader.BaseStream.Seek($file.Offset, "Begin")
+                        $buffer = [byte[]]::CreateInstance([byte], $file.Size)
+                        [void]$reader.Read($buffer, 0, $file.Size)
+                    }
+                }
+
+                if (($file.SeekType -eq 0) -and ($null -ne $buffer)) {
+                    [System.IO.File]::WriteAllBytes($FilePath, $buffer)
+
+                    # write created/modified date
+                    $dtDateTime = $ConvertTimestamp.Invoke($file.Timestamp)[0]
+                    $FileData = Get-Item -LiteralPath $FilePath
+                    $FileData.LastWriteTime = $dtDateTime
+                    $FileData.CreationTime = $dtDateTime
+                }
             }
+
+            $reader.Close()
         }
     }
 })
@@ -890,7 +1042,7 @@ $Sync.Gui.mnuRenameFolder.add_Click({
     }
 })
 
-$Sync.Gui.mnuAddFiles.add_Click({
+[ScriptBlock]$AddFilesFunc = {
     $ofd = New-Object Microsoft.Win32.OpenFileDialog -Property @{
         Filter = "All files (*.*)|*.*"
         Multiselect = $true
@@ -902,7 +1054,7 @@ $Sync.Gui.mnuAddFiles.add_Click({
 
     if ($ofd.ShowDialog()) {
         $item = $Sync.Gui.treeVPP.SelectedItem
-        $path = $item.Tag.ToString()
+        $path = if ($null -ne $item) { $item.Tag.ToString() } else { "data" }
 
         foreach ($filename in $ofd.FileNames) {
             $FileItem = Get-Item -LiteralPath $filename
@@ -910,16 +1062,18 @@ $Sync.Gui.mnuAddFiles.add_Click({
             [void]$Sync.ViewFiles.Add((New-Object FileViewModel -Property @{
                 Offset = 0
                 Size = $FileItem.Length
-                Filename = $FileItem.Name
+                Filename = $filename
                 Timestamp = (New-TimeSpan -Start (Get-Date "01/01/1970") -End ($FileItem.LastWriteTime)).TotalSeconds
                 Path = $path
-                Data = [System.IO.File]::ReadAllBytes($filename)
+                SeekType = [SeekTypes]::FileSystem
             }))
 
             $global:Flag_Changed = $true
         }
     }
-})
+}
+
+$Sync.Gui.mnuAddFiles.add_Click($AddFilesFunc)
 
 $Sync.Gui.gridFiles.add_PreviewKeyDown({
     $item = $_
@@ -1024,17 +1178,18 @@ $Sync.Gui.mnuRemoveFiles.add_Click({
 $Sync.Window.add_Loaded({
     $CreateNewVPP.Invoke()
 
-    # debug
-    if ($host.Name -ne "ConsoleHost") {
-        [string]$UIModulePath = Join-Path $PSScriptRoot "MyUIAutomationModule.ps1"
-
-        if (Test-Path -LiteralPath $UIModulePath) {
-            Import-Module $UIModulePath
-            $h = (Get-Process -Id $PID).MainWindowHandle
-            [void][WinAp]::ShowWindow($h, [WindowState]::SW_SHOWMINIMIZED)
-            [void][WinAp]::ShowWindow($h, [WindowState]::SW_SHOWNORMAL)
-            Remove-Module -Name MyUIAutomationModule
-        }
+    # bring app to front in VSCode
+    if ($host.Name -eq "Visual Studio Code Host") {
+        Invoke-Expression @'
+    $z="$global:PSScriptRoot\WinAPI.ps1"
+    if(Test-Path $z){
+        ipmo $z
+        $h=(gps -Id $PID).MainWindowHandle
+        Show-Window $h 2
+        Show-Window $h 1
+        rmo WinAPI
+    }
+'@
     }
 })
 
